@@ -16,58 +16,79 @@ def send_email(to_email, subject, body_html):
     settings = database.get_settings()
     if not settings:
         raise Exception("Settings not configured")
-    
+        
     sender_email = settings['email']
-    sender_domain = sender_email.split('@')[-1]
+    password = settings['password']
     
-    # Build message to exactly match HostGator Roundcube webmail output
-    msg = MIMEMultipart("alternative")
+    import requests
+    import re
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     
-    # === HEADERS (matching Roundcube webmail exactly) ===
-    msg["MIME-Version"] = "1.0"
-    msg["Date"] = formatdate(localtime=True)
-    msg["From"] = sender_email
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg["Reply-To"] = sender_email
+    session = requests.Session()
+    # 1. Login to cPanel webmail
+    url = 'https://sh008.hostgator.in:2096/login/'
+    data = {'user': sender_email, 'pass': password}
+    r = session.post(url, data=data, verify=False, allow_redirects=True)
     
-    # Message-ID matching HostGator Roundcube format
-    unique_id = uuid.uuid4().hex[:16]
-    timestamp = int(time.time())
-    msg["Message-ID"] = f"<{unique_id}.{timestamp}@{sender_domain}>"
+    if 'cpsess' not in r.url:
+        raise Exception("Roundcube login failed. Check email and password.")
+        
+    base_url = r.url.split('/3rdparty')[0] + '/3rdparty/roundcube/'
     
-    # Roundcube headers
-    msg["X-Sender"] = sender_email
-    msg["X-Mailer"] = "Roundcube Webmail/1.6.6"
-    msg["User-Agent"] = "Roundcube Webmail/1.6.6"
+    # 2. GET the compose page to initialize a compose session and get _id
+    compose_url = base_url + '?_task=mail&_action=compose'
+    rc = session.get(compose_url, verify=False)
     
-    # Create plain text version by stripping HTML tags
-    body_plain = re.sub(r'<br\s*/?>', '\n', body_html)
-    body_plain = re.sub(r'<p[^>]*>', '\n', body_plain)
-    body_plain = re.sub(r'</p>', '\n', body_plain)
-    body_plain = re.sub(r'<[^>]+>', '', body_plain)
-    body_plain = body_plain.strip()
-    if not body_plain:
-        body_plain = body_html
+    # Extract token
+    token_match = re.search(r'"request_token":"([^"]+)"', rc.text)
+    if not token_match:
+        raise Exception("Roundcube token not found")
+    token = token_match.group(1)
     
-    # Plain text part first (RFC 2046 - last part is preferred, so HTML goes last)
-    part_plain = MIMEText(body_plain, "plain", "utf-8")
-    part_plain.replace_header("Content-Transfer-Encoding", "quoted-printable")
+    # Extract compose _id
+    id_match = re.search(r'name="_id"\s+value="([^"]+)"', rc.text)
+    if not id_match:
+        raise Exception("Roundcube compose ID not found")
+    compose_id = id_match.group(1)
     
-    part_html = MIMEText(body_html, "html", "utf-8")
-    part_html.replace_header("Content-Transfer-Encoding", "quoted-printable")
+    # 3. Send email
+    send_url = f"{base_url}?_task=mail&_action=send"
     
-    msg.attach(part_plain)
-    msg.attach(part_html)
+    headers = {
+        'Origin': base_url.replace('/3rdparty/roundcube/', ''),
+        'Referer': compose_url,
+        'X-Roundcube-Request-Token': token,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
     
-    # === SEND via SMTP with proper EHLO ===
-    server = smtplib.SMTP_SSL(settings['smtp_host'], int(settings['smtp_port']))
-    # EHLO with the actual domain (not "localhost" - this is critical for spam filters)
-    server.ehlo(sender_domain)
-    server.login(sender_email, settings['password'])
-    server.sendmail(sender_email, to_email, msg.as_string())
-    server.quit()
+    payload = {
+        '_token': token,
+        '_task': 'mail',
+        '_action': 'send',
+        '_id': compose_id,
+        '_attachments': '',
+        '_from': sender_email,
+        '_to': to_email,
+        '_cc': '',
+        '_bcc': '',
+        '_replyto': '',
+        '_followupto': '',
+        '_subject': subject,
+        '_mdn': '0',
+        '_dsn': '0',
+        '_keepformatting': '1',
+        '_draft': '',
+        'editorSelector': 'html',
+        '_is_html': '1',
+        '_framed': '1',
+        '_message': body_html
+    }
     
+    res = session.post(send_url, data=payload, headers=headers, verify=False)
+    if "message sent successfully" not in res.text.lower() and res.status_code != 200:
+        raise Exception("Failed to send email via Roundcube API")
+        
     # Save to local database
     database.save_email(
         folder='sent',
