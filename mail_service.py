@@ -4,48 +4,75 @@ import email
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
-from email.utils import make_msgid, formatdate
+from email.utils import make_msgid, formatdate, formataddr
 import database
+import re
+import datetime
+import uuid
+import time
+
 
 def send_email(to_email, subject, body_html):
     settings = database.get_settings()
     if not settings:
         raise Exception("Settings not configured")
     
-    # Send via SMTP
+    sender_email = settings['email']
+    sender_domain = sender_email.split('@')[-1]
+    
+    # Build message to exactly match HostGator Roundcube webmail output
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = settings['email']
-    msg["To"] = to_email
+    
+    # === HEADERS (matching Roundcube webmail exactly) ===
+    msg["MIME-Version"] = "1.0"
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain=settings['email'].split('@')[-1])
-    msg["X-Mailer"] = "Roundcube Webmail/1.4.12"
+    msg["From"] = sender_email
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg["Reply-To"] = sender_email
     
-    # Create plain text version by stripping HTML
-    import re
-    body_plain = re.sub('<[^<]+>', '', body_html)
-    if not body_plain.strip():
-        body_plain = "This is an HTML email."
-        
-    part1 = MIMEText(body_plain, "plain", "utf-8")
-    part2 = MIMEText(body_html, "html", "utf-8")
+    # Message-ID matching HostGator Roundcube format
+    unique_id = uuid.uuid4().hex[:16]
+    timestamp = int(time.time())
+    msg["Message-ID"] = f"<{unique_id}.{timestamp}@{sender_domain}>"
     
-    # Attach parts into message container.
-    # According to RFC 2046, the last part of a multipart/alternative assembly is best and preferred.
-    msg.attach(part1)
-    msg.attach(part2)
+    # Roundcube headers
+    msg["X-Sender"] = sender_email
+    msg["X-Mailer"] = "Roundcube Webmail/1.6.6"
+    msg["User-Agent"] = "Roundcube Webmail/1.6.6"
     
+    # Create plain text version by stripping HTML tags
+    body_plain = re.sub(r'<br\s*/?>', '\n', body_html)
+    body_plain = re.sub(r'<p[^>]*>', '\n', body_plain)
+    body_plain = re.sub(r'</p>', '\n', body_plain)
+    body_plain = re.sub(r'<[^>]+>', '', body_plain)
+    body_plain = body_plain.strip()
+    if not body_plain:
+        body_plain = body_html
+    
+    # Plain text part first (RFC 2046 - last part is preferred, so HTML goes last)
+    part_plain = MIMEText(body_plain, "plain", "utf-8")
+    part_plain.replace_header("Content-Transfer-Encoding", "quoted-printable")
+    
+    part_html = MIMEText(body_html, "html", "utf-8")
+    part_html.replace_header("Content-Transfer-Encoding", "quoted-printable")
+    
+    msg.attach(part_plain)
+    msg.attach(part_html)
+    
+    # === SEND via SMTP with proper EHLO ===
     server = smtplib.SMTP_SSL(settings['smtp_host'], int(settings['smtp_port']))
-    server.login(settings['email'], settings['password'])
-    server.sendmail(settings['email'], to_email, msg.as_string())
+    # EHLO with the actual domain (not "localhost" - this is critical for spam filters)
+    server.ehlo(sender_domain)
+    server.login(sender_email, settings['password'])
+    server.sendmail(sender_email, to_email, msg.as_string())
     server.quit()
     
-    # Save to Local Database only
-    import datetime
+    # Save to local database
     database.save_email(
         folder='sent',
         subject=subject,
-        sender=settings['email'],
+        sender=sender_email,
         recipient=to_email,
         body=body_html,
         date_received=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
